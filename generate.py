@@ -8,9 +8,11 @@ import pandas as pd
 
 sys.dont_write_bytecode = True
 
-from main import FIELD_X, FIELD_Y, make_machine
+from planner import make_machine
 
-
+FIELD_X = 240.0
+FIELD_Y = 120.0
+TURN_ZONE_WIDTH = 10.0
 BASE_HEADER = 6.0
 BASE_WORK_SPEED = 2.0
 BASE_LENGTH = 5.0
@@ -82,6 +84,9 @@ def generate_scenarios() -> pd.DataFrame:
                 {
                     "scenario_id": len(rows) + 1,
                     "s": axis,
+                    "field_x": FIELD_X,
+                    "field_y": FIELD_Y,
+                    "turn_zone_width": TURN_ZONE_WIDTH,
                     "cond_l": header_relation,
                     "cond_U": speed_relation,
                     "cond_hx": length_relation,
