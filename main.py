@@ -15,13 +15,14 @@ from PyQt6.QtCore import (
     QObject,
     QPointF,
     QRectF,
-    QThread,
     Qt,
+    QThread,
     pyqtSignal,
     pyqtSlot,
 )
 from PyQt6.QtGui import (
     QBrush,
+    QCloseEvent,
     QColor,
     QFont,
     QFontDatabase,
@@ -49,9 +50,9 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -68,7 +69,6 @@ from planner import (
     evaluate_strategies,
     plan_is_better,
 )
-
 
 STRATEGIES = (
     ("1_Пополам", "strat1", "Пополам"),
@@ -161,9 +161,8 @@ def optional_bool(row: pd.Series, name: str, default: bool = False) -> bool:
         return default
     if isinstance(raw_value, bool):
         return raw_value
-    if isinstance(raw_value, (int, float)):
-        if float(raw_value) in {0.0, 1.0}:
-            return bool(raw_value)
+    if isinstance(raw_value, (int, float)) and float(raw_value) in {0.0, 1.0}:
+        return bool(raw_value)
     text_value = str(raw_value).strip().lower()
     if text_value in {"1", "true", "yes", "да"}:
         return True
@@ -195,8 +194,6 @@ def geometry_from_row(row: pd.Series) -> FieldGeometry:
     return_to_start = optional_bool(row, "return_to_start", False)
     if not 0.0 <= allowed_gap_percent <= 100.0:
         raise ValueError("поле 'allowed_gap_percent' должно быть от 0 до 100")
-    if 2.0 * turn_zone >= min(field_x, field_y):
-        raise ValueError("две разворотные зоны должны быть уже каждой стороны поля")
     return FieldGeometry(
         axis,
         field_x,
@@ -230,6 +227,16 @@ def machine_from_row(row: pd.Series, index: int,
         raise ValueError(f"coord{index}_x должна находиться в пределах поля")
     if not 0.0 <= start_y <= geometry.field_y:
         raise ValueError(f"coord{index}_y должна находиться в пределах поля")
+    if geometry.return_to_start and not (
+        math.isclose(start_x, 0.0, abs_tol=1e-9)
+        or math.isclose(start_x, geometry.field_x, abs_tol=1e-9)
+        or math.isclose(start_y, 0.0, abs_tol=1e-9)
+        or math.isclose(start_y, geometry.field_y, abs_tol=1e-9)
+    ):
+        raise ValueError(
+            f"при возврате к старту coord{index}_x/coord{index}_y "
+            "должны задавать точку на границе поля"
+        )
     return Machine(
         header=header,
         work_speed=work_speed,
@@ -266,8 +273,8 @@ def evaluate_scenario(
         machine_from_row(row, 1, selected_geometry),
         machine_from_row(row, 2, selected_geometry),
     )
-    axes = ("x", "y") if compare_axes else (selected_geometry.axis,)
-    geometries = {
+    requested_axes = ("x", "y") if compare_axes else (selected_geometry.axis,)
+    candidate_geometries = {
         axis: FieldGeometry(
             axis,
             selected_geometry.field_x,
@@ -276,8 +283,24 @@ def evaluate_scenario(
             selected_geometry.allowed_gap_fraction,
             selected_geometry.return_to_start,
         )
-        for axis in axes
+        for axis in requested_axes
     }
+    axes = tuple(
+        axis
+        for axis, geometry in candidate_geometries.items()
+        if geometry.run_length > 0.0
+    )
+    if not compare_axes and selected_geometry.axis not in axes:
+        raise ValueError(
+            "ширина двух разворотных зон должна быть меньше размера поля "
+            f"вдоль оси {selected_geometry.axis.upper()}"
+        )
+    if not axes:
+        raise ValueError(
+            "ширина двух разворотных зон должна быть меньше размера поля "
+            "хотя бы вдоль одного направления проходов"
+        )
+    geometries = {axis: candidate_geometries[axis] for axis in axes}
     evaluated = {
         axis: evaluate_strategies(geometry, machines)
         for axis, geometry in geometries.items()
@@ -287,9 +310,11 @@ def evaluate_scenario(
         best_plan: Plan | None = None
         for axis in axes:
             candidate = evaluated[axis][plan_name]
-            if plan_is_better(candidate, best_plan):
+            if best_plan is None or plan_is_better(candidate, best_plan):
                 best_plan = candidate
-        plans[plan_name] = best_plan or evaluated[selected_geometry.axis][plan_name]
+        if best_plan is None:
+            raise RuntimeError("не удалось оценить стратегию")
+        plans[plan_name] = best_plan
 
     winner: Plan | None = None
     for plan in plans.values():
@@ -321,7 +346,11 @@ def evaluate_scenario(
     result["Winner"] = winner.name if winner else "Нет допустимой стратегии"
     result["Winner_time"] = round(winner.makespan, 1) if winner else None
     result["Winner_axis"] = winner.axis.upper() if winner else None
-    winner_geometry = geometries[winner.axis] if winner else selected_geometry
+    winner_geometry = (
+        geometries[winner.axis]
+        if winner
+        else geometries.get(selected_geometry.axis, geometries[axes[0]])
+    )
     return ScenarioEvaluation(result, plans, winner, winner_geometry)
 
 
@@ -495,7 +524,7 @@ class RouteCanvas(QWidget):
             return 0, 0
         return route.pass_count, route.turn_count
 
-    def paintEvent(self, event: object) -> None:  # noqa: N802
+    def paintEvent(self, event: object) -> None:
         del event
         painter = QPainter(self)
         self._draw_scene(painter, float(self.width()), float(self.height()))
@@ -705,7 +734,7 @@ class NumericInput(QDoubleSpinBox):
             QSizePolicy.Policy.Fixed,
         )
 
-    def wheelEvent(self, event: QWheelEvent | None) -> None:  # noqa: N802
+    def wheelEvent(self, event: QWheelEvent | None) -> None:
         if event is not None:
             event.ignore()
 
@@ -899,7 +928,16 @@ class TableTab(QWidget):
             return
         try:
             path = Path(filename)
-            self.frame = read_xlsx(path)
+            frame = read_xlsx(path)
+            missing = sorted(
+                REQUIRED_COLUMNS - {str(column) for column in frame.columns}
+            )
+            if missing:
+                raise ValueError(
+                    "Во входной таблице отсутствуют столбцы: "
+                    f"{', '.join(missing)}"
+                )
+            self.frame = frame
             self.input_path = path
             self.output_path = path.with_name(f"{path.stem}_result.xlsx")
             self.input_edit.setText(str(path))
@@ -1099,7 +1137,12 @@ class SingleTab(QWidget):
             for item_index, ((field_name, label), value) in enumerate(zip(
                 self.MACHINE_FIELDS, defaults[machine_index], strict=True
             )):
-                minimum = -360.0 if field_name == "orient" else 0.0
+                if field_name == "orient":
+                    minimum = -360.0
+                elif field_name.startswith("coord_"):
+                    minimum = 0.0
+                else:
+                    minimum = 0.001
                 spin = make_spin(value, minimum=minimum)
                 spin.setFixedHeight(28)
                 if field_name == "orient":
@@ -1124,6 +1167,10 @@ class SingleTab(QWidget):
                 QSizePolicy.Policy.Maximum,
             )
             machines_layout.addWidget(group)
+
+        self.field_x.valueChanged.connect(self.update_coordinate_limits)
+        self.field_y.valueChanged.connect(self.update_coordinate_limits)
+        self.update_coordinate_limits()
 
         self.winner_label = QLabel("Лучший план ещё не рассчитан")
         self.winner_label.setWordWrap(True)
@@ -1227,6 +1274,13 @@ class SingleTab(QWidget):
             )
         )
         layout.addLayout(content, 1)
+
+    def update_coordinate_limits(self) -> None:
+        """Не позволять стартовым координатам выходить за границы поля."""
+
+        for machine_index in (1, 2):
+            self.inputs[f"coord_x{machine_index}"].setMaximum(self.field_x.value())
+            self.inputs[f"coord_y{machine_index}"].setMaximum(self.field_y.value())
 
     def build_row(self) -> pd.Series:
         values: dict[str, object] = {
@@ -1393,11 +1447,33 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Inagrika — планировщик уборки")
         self.setMinimumSize(1180, 720)
         self.resize(1440, 900)
+        self.table_tab = TableTab()
+        self.single_tab = SingleTab()
         tabs = QTabWidget()
         tabs.setObjectName("mainTabs")
-        tabs.addTab(TableTab(), "Загрузить таблицу")
-        tabs.addTab(SingleTab(), "Рассчитать частный случай")
+        tabs.addTab(self.table_tab, "Загрузить таблицу")
+        tabs.addTab(self.single_tab, "Рассчитать частный случай")
         self.setCentralWidget(tabs)
+
+    def closeEvent(self, event: QCloseEvent | None) -> None:
+        """Не уничтожать активный QThread во время расчёта."""
+
+        active_threads = (
+            self.table_tab.worker_thread,
+            self.single_tab.worker_thread,
+        )
+        if any(thread is not None and thread.isRunning() for thread in active_threads):
+            if event is not None:
+                event.ignore()
+            show_dialog(
+                self,
+                QMessageBox.Icon.Warning,
+                "Расчёт ещё выполняется",
+                "Дождитесь завершения фонового расчёта перед закрытием приложения.",
+            )
+            return
+        if event is not None:
+            event.accept()
 
 
 def configure_application(app: QApplication) -> None:

@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-
 # Геометрия поля и разворотных зон, м.
 FIELD_X = 240.0
 FIELD_Y = 120.0
@@ -532,11 +531,10 @@ def build_route(machine: Machine, geometry: FieldGeometry, passes: list[float],
         builder.move_to(work_end, machine.work_speed, "work")
         boundary = not boundary
 
-        if index + 1 < len(ordered):
-            if not append_radial_turn(
-                builder, geometry, lateral, ordered[index + 1], boundary
-            ):
-                return None
+        if index + 1 < len(ordered) and not append_radial_turn(
+            builder, geometry, lateral, ordered[index + 1], boundary
+        ):
+            return None
 
     # Освобождаем рабочую и разворотную зоны после последнего прохода.
     final_parking = geometry.outer_point(ordered[-1], boundary)
@@ -912,7 +910,7 @@ def evaluate_contiguous(name: str, geometry: FieldGeometry,
             region_passes(begins[1], widths[1], machines[1].header),
         )
         candidate = evaluate_assignment(name, geometry, machines, passes)
-        if plan_is_better(candidate, best):
+        if best is None or plan_is_better(candidate, best):
             best = candidate
 
     return best or Plan(name=name, axis=geometry.axis)
@@ -945,7 +943,7 @@ def evaluate_strips(geometry: FieldGeometry,
     for first_machine in (0, 1):
         passes, _ = alternating_passes(geometry, machines, first_machine)
         candidate = evaluate_assignment("2_Полосами", geometry, machines, passes)
-        if plan_is_better(candidate, best):
+        if best is None or plan_is_better(candidate, best):
             best = candidate
     return best or Plan(name="2_Полосами", axis=geometry.axis)
 
