@@ -47,8 +47,8 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
-    QSplitter,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -473,7 +473,7 @@ class RouteCanvas(QWidget):
         super().__init__()
         self.plan: Plan | None = None
         self.field_geometry: FieldGeometry | None = None
-        self.setMinimumSize(620, 360)
+        self.setMinimumSize(420, 220)
         self.setObjectName("routeCanvas")
 
     def set_route(self, plan: Plan | None, geometry: FieldGeometry | None) -> None:
@@ -1130,10 +1130,10 @@ class SingleTab(QWidget):
         self.winner_label = QLabel("Лучший план ещё не рассчитан")
         self.winner_label.setWordWrap(True)
         self.winner_label.setObjectName("winnerCard")
-        self.winner_label.setMinimumHeight(68)
+        self.winner_label.setMinimumHeight(60)
         self.results = QTableWidget(3, 7)
         self.results.setObjectName("resultTable")
-        self.results.setMinimumHeight(175)
+        self.results.setMinimumHeight(150)
         self.results.setHorizontalHeaderLabels(
             [
                 "Стратег.",
@@ -1168,14 +1168,17 @@ class SingleTab(QWidget):
         self.calculate_button.clicked.connect(self.start_calculation)
         self.save_button.clicked.connect(self.save_report)
         self.save_image_button.clicked.connect(self.save_image)
-        buttons = QHBoxLayout()
-        buttons.addWidget(self.calculate_button)
-        buttons.addWidget(self.save_button)
-        buttons.addWidget(self.save_image_button)
-        buttons.addStretch()
+        buttons = QGridLayout()
+        buttons.setHorizontalSpacing(10)
+        buttons.setVerticalSpacing(8)
+        buttons.addWidget(self.calculate_button, 0, 0, 1, 2)
+        buttons.addWidget(self.save_button, 1, 0)
+        buttons.addWidget(self.save_image_button, 1, 1)
+        buttons.setColumnStretch(0, 1)
+        buttons.setColumnStretch(1, 1)
 
         input_card, input_card_layout = make_card()
-        input_card.setMinimumWidth(620)
+        input_card.setMinimumWidth(640)
         input_card_layout.addWidget(make_section_title("Числовые параметры"))
         input_hint = QLabel(
             "Выбранное направление применяется ко всем стратегиям. Чтобы сравнить "
@@ -1190,18 +1193,31 @@ class SingleTab(QWidget):
         input_card_layout.addStretch(1)
 
         result_card, result_layout = make_card()
-        result_card.setMinimumWidth(500)
+        result_card.setMinimumWidth(460)
         result_layout.addWidget(make_section_title("Результат и выбранный маршрут"))
         result_layout.addWidget(self.winner_label)
         result_layout.addWidget(self.results)
         result_layout.addWidget(self.canvas, 1)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setChildrenCollapsible(False)
-        splitter.addWidget(input_card)
-        splitter.addWidget(result_card)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([680, 720])
+
+        input_scroll = QScrollArea()
+        input_scroll.setObjectName("inputScroll")
+        input_scroll.setWidgetResizable(True)
+        input_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        input_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        input_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        input_scroll.setFixedWidth(670)
+        input_scroll.setWidget(input_card)
+
+        content = QHBoxLayout()
+        content.setContentsMargins(0, 0, 0, 0)
+        content.setSpacing(10)
+        content.addWidget(input_scroll)
+        content.addWidget(result_card, 1)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(14)
@@ -1212,7 +1228,7 @@ class SingleTab(QWidget):
                 "Приложение сравнит стратегии, объяснит ограничения и нарисует маршрут.",
             )
         )
-        layout.addWidget(splitter)
+        layout.addLayout(content, 1)
 
     def build_row(self) -> pd.Series:
         values: dict[str, object] = {
@@ -1377,18 +1393,13 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Inagrika — планировщик уборки")
-        self.setMinimumSize(1280, 900)
-        self.resize(1440, 960)
+        self.setMinimumSize(1180, 720)
+        self.resize(1440, 900)
         tabs = QTabWidget()
         tabs.setObjectName("mainTabs")
         tabs.addTab(TableTab(), "Загрузить таблицу")
         tabs.addTab(SingleTab(), "Рассчитать частный случай")
         self.setCentralWidget(tabs)
-        status_bar = self.statusBar()
-        if status_bar is not None:
-            status_bar.showMessage(
-                "Входные данные числовые; знаки сравнения вычисляются автоматически"
-            )
 
 
 def configure_application(app: QApplication) -> None:
@@ -1502,8 +1513,8 @@ def configure_application(app: QApplication) -> None:
         QWidget#routeCanvas {
             border: 1px solid #cbd5e1; border-radius: 9px; background: #ffffff;
         }
-        QSplitter::handle { background: #dbe3ed; height: 5px; }
-        QStatusBar { background: #ffffff; color: #475569; border-top: 1px solid #dbe3ed; }
+        QScrollArea#inputScroll { background: transparent; border: none; }
+        QScrollArea#inputScroll > QWidget > QWidget { background: transparent; }
         QScrollBar:vertical {
             background: #f1f5f9; width: 12px; margin: 0; border-radius: 6px;
         }
