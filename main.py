@@ -1444,7 +1444,7 @@ class SingleTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Inagrika — планировщик уборки")
+        self.setWindowTitle("Prime — планировщик уборки")
         self.setMinimumSize(1180, 720)
         self.resize(1440, 900)
         self.table_tab = TableTab()

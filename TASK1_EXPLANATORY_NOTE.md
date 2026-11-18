@@ -576,7 +576,7 @@ distance(t) <= r_safe_1 + r_safe_2
 1. Исходный код (`src/`).
 2. Документация (`APP_DOCUMENTATION.md`, `GENERATOR_DOCUMENTATION.md`).
 3. Сгенерированные данные для сценариев А-Г и матрица из 162 сценариев (`.xlsx`).
-4. Исполняемый файл `Inagrika.exe`.
+4. Исполняемый файл `Prime.exe`.
 
 ## 8. Ожидаемый эффект
 

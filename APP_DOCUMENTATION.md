@@ -1,4 +1,4 @@
-# Пояснительная записка к приложению Inagrika
+# Пояснительная записка к приложению Prime
 
 ## 1. Основание для разработки
 
@@ -365,7 +365,7 @@ distance <= collision_radius_1 + collision_radius_2
 Готовое приложение:
 
 ```text
-dist\Inagrika.exe
+dist\Prime.exe
 ```
 
 Запуск исходного кода:
