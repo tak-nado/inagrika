@@ -254,39 +254,44 @@ def plan_value(plan: Plan, attribute: str, digits: int = 1) -> float | None:
     return round(float(raw_value), digits)
 
 
-def evaluate_scenario(row: pd.Series) -> ScenarioEvaluation:
-    """Рассчитать базовый и улучшенные планы с выбором направления."""
+def evaluate_scenario(
+    row: pd.Series,
+    *,
+    compare_improved_axes: bool = True,
+) -> ScenarioEvaluation:
+    """Рассчитать планы с фиксированным или оптимизируемым направлением."""
 
-    baseline_geometry = geometry_from_row(row)
+    selected_geometry = geometry_from_row(row)
     machines = (
-        machine_from_row(row, 1, baseline_geometry),
-        machine_from_row(row, 2, baseline_geometry),
+        machine_from_row(row, 1, selected_geometry),
+        machine_from_row(row, 2, selected_geometry),
     )
+    axes = ("x", "y") if compare_improved_axes else (selected_geometry.axis,)
     geometries = {
         axis: FieldGeometry(
             axis,
-            baseline_geometry.field_x,
-            baseline_geometry.field_y,
-            baseline_geometry.turn_zone_width,
-            baseline_geometry.allowed_gap_fraction,
-            baseline_geometry.return_to_start,
+            selected_geometry.field_x,
+            selected_geometry.field_y,
+            selected_geometry.turn_zone_width,
+            selected_geometry.allowed_gap_fraction,
+            selected_geometry.return_to_start,
         )
-        for axis in ("x", "y")
+        for axis in axes
     }
     evaluated = {
         axis: evaluate_strategies(geometry, machines)
         for axis, geometry in geometries.items()
     }
     plans: dict[str, Plan] = {
-        "1_Пополам": evaluated[baseline_geometry.axis]["1_Пополам"]
+        "1_Пополам": evaluated[selected_geometry.axis]["1_Пополам"]
     }
     for plan_name in ("2_Полосами", "3_По_производительности"):
         best_plan: Plan | None = None
-        for axis in ("x", "y"):
+        for axis in axes:
             candidate = evaluated[axis][plan_name]
             if plan_is_better(candidate, best_plan):
                 best_plan = candidate
-        plans[plan_name] = best_plan or evaluated[baseline_geometry.axis][plan_name]
+        plans[plan_name] = best_plan or evaluated[selected_geometry.axis][plan_name]
 
     winner: Plan | None = None
     for plan in plans.values():
@@ -318,7 +323,7 @@ def evaluate_scenario(row: pd.Series) -> ScenarioEvaluation:
     result["Winner"] = winner.name if winner else "Нет допустимой стратегии"
     result["Winner_time"] = round(winner.makespan, 1) if winner else None
     result["Winner_axis"] = winner.axis.upper() if winner else None
-    winner_geometry = geometries[winner.axis] if winner else baseline_geometry
+    winner_geometry = geometries[winner.axis] if winner else selected_geometry
     return ScenarioEvaluation(result, plans, winner, winner_geometry)
 
 
@@ -451,7 +456,9 @@ class SingleWorker(QObject):
     @pyqtSlot()
     def run(self) -> None:
         try:
-            self.completed.emit(evaluate_scenario(self.row))
+            self.completed.emit(
+                evaluate_scenario(self.row, compare_improved_axes=False)
+            )
         except Exception as error:  # noqa: BLE001
             self.failed.emit(str(error))
 
@@ -1045,8 +1052,9 @@ class SingleTab(QWidget):
         field_grid.setContentsMargins(0, 0, 0, 0)
         field_grid.setHorizontalSpacing(10)
         field_grid.setVerticalSpacing(4)
+        field_grid.setAlignment(Qt.AlignmentFlag.AlignTop)
         field_values = (
-            ("Базовое направление", self.axis),
+            ("Направление проходов", self.axis),
             ("Размер поля X, м", self.field_x),
             ("Размер поля Y, м", self.field_y),
             ("Ширина разворотной зоны, м", self.turn_zone),
@@ -1068,6 +1076,10 @@ class SingleTab(QWidget):
         field_group = QGroupBox()
         field_group.setObjectName("fieldGroup")
         field_group.setLayout(field_layout)
+        field_group.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Maximum,
+        )
 
         defaults = {
             1: (6.0, 2.0, 2.5, 1.5, 5.0, 3.0, 2.5, 0.0, 3.0, 0.0),
@@ -1075,11 +1087,13 @@ class SingleTab(QWidget):
         }
         machines_layout = QHBoxLayout()
         machines_layout.setSpacing(10)
+        machines_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         for machine_index in (1, 2):
             machine_grid = QGridLayout()
             machine_grid.setContentsMargins(0, 0, 0, 0)
             machine_grid.setHorizontalSpacing(10)
             machine_grid.setVerticalSpacing(4)
+            machine_grid.setAlignment(Qt.AlignmentFlag.AlignTop)
             machine_header = QLabel(f"Машина {machine_index}")
             machine_header.setObjectName("groupHeader")
             machine_header.setProperty("accent", f"machine{machine_index}")
@@ -1107,11 +1121,16 @@ class SingleTab(QWidget):
             group = QGroupBox()
             group.setObjectName(f"machine{machine_index}")
             group.setLayout(machine_layout)
+            group.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Maximum,
+            )
             machines_layout.addWidget(group)
 
         self.winner_label = QLabel("Лучший план ещё не рассчитан")
         self.winner_label.setWordWrap(True)
         self.winner_label.setObjectName("winnerCard")
+        self.winner_label.setMinimumHeight(68)
         self.results = QTableWidget(3, 7)
         self.results.setObjectName("resultTable")
         self.results.setMinimumHeight(175)
@@ -1159,15 +1178,16 @@ class SingleTab(QWidget):
         input_card.setMinimumWidth(620)
         input_card_layout.addWidget(make_section_title("Числовые параметры"))
         input_hint = QLabel(
-            "Базовый план использует выбранное направление; улучшенные планы "
-            "автоматически сравнивают X и Y."
+            "Выбранное направление применяется ко всем стратегиям. Чтобы сравнить "
+            "варианты, выполните расчёт отдельно для X и Y."
         )
         input_hint.setObjectName("mutedText")
         input_hint.setWordWrap(True)
         input_card_layout.addWidget(input_hint)
         input_card_layout.addWidget(field_group)
-        input_card_layout.addLayout(machines_layout, 1)
+        input_card_layout.addLayout(machines_layout)
         input_card_layout.addLayout(buttons)
+        input_card_layout.addStretch(1)
 
         result_card, result_layout = make_card()
         result_card.setMinimumWidth(500)
@@ -1436,7 +1456,16 @@ def configure_application(app: QApplication) -> None:
         QPushButton[variant="secondary"]:hover { background: #eff6ff; }
         QLineEdit, QComboBox, QTextEdit {
             min-height: 34px; background: #ffffff; border: 1px solid #cbd5e1;
-            border-radius: 6px; padding: 2px 8px; selection-background-color: #bfdbfe;
+            border-radius: 6px; padding: 2px 8px; color: #0f172a;
+            selection-background-color: #bfdbfe; selection-color: #0f172a;
+        }
+        QComboBox QAbstractItemView {
+            background: #ffffff; color: #0f172a; border: 1px solid #94a3b8;
+            outline: 0; selection-background-color: #dbeafe;
+            selection-color: #0f172a;
+        }
+        QComboBox QAbstractItemView::item {
+            min-height: 30px; padding: 4px 8px;
         }
         QDoubleSpinBox {
             background: #ffffff; border: 1px solid #cbd5e1;
