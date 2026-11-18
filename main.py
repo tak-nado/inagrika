@@ -257,7 +257,7 @@ def plan_value(plan: Plan, attribute: str, digits: int = 1) -> float | None:
 def evaluate_scenario(
     row: pd.Series,
     *,
-    compare_improved_axes: bool = True,
+    compare_axes: bool = True,
 ) -> ScenarioEvaluation:
     """Рассчитать планы с фиксированным или оптимизируемым направлением."""
 
@@ -266,7 +266,7 @@ def evaluate_scenario(
         machine_from_row(row, 1, selected_geometry),
         machine_from_row(row, 2, selected_geometry),
     )
-    axes = ("x", "y") if compare_improved_axes else (selected_geometry.axis,)
+    axes = ("x", "y") if compare_axes else (selected_geometry.axis,)
     geometries = {
         axis: FieldGeometry(
             axis,
@@ -282,10 +282,8 @@ def evaluate_scenario(
         axis: evaluate_strategies(geometry, machines)
         for axis, geometry in geometries.items()
     }
-    plans: dict[str, Plan] = {
-        "1_Пополам": evaluated[selected_geometry.axis]["1_Пополам"]
-    }
-    for plan_name in ("2_Полосами", "3_По_производительности"):
+    plans: dict[str, Plan] = {}
+    for plan_name, _, _ in STRATEGIES:
         best_plan: Plan | None = None
         for axis in axes:
             candidate = evaluated[axis][plan_name]
@@ -457,7 +455,7 @@ class SingleWorker(QObject):
     def run(self) -> None:
         try:
             self.completed.emit(
-                evaluate_scenario(self.row, compare_improved_axes=False)
+                evaluate_scenario(self.row, compare_axes=False)
             )
         except Exception as error:  # noqa: BLE001
             self.failed.emit(str(error))
