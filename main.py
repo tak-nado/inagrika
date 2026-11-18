@@ -11,7 +11,15 @@ import pandas as pd
 
 sys.dont_write_bytecode = True
 
-from PyQt6.QtCore import QObject, QPointF, QRectF, QThread, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import (
+    QObject,
+    QPointF,
+    QRectF,
+    QThread,
+    Qt,
+    pyqtSignal,
+    pyqtSlot,
+)
 from PyQt6.QtGui import (
     QBrush,
     QColor,
@@ -21,6 +29,7 @@ from PyQt6.QtGui import (
     QLinearGradient,
     QPainter,
     QPen,
+    QWheelEvent,
 )
 from PyQt6.QtWidgets import (
     QApplication,
@@ -28,7 +37,6 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
-    QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -39,8 +47,8 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSplitter,
-    QScrollArea,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -77,11 +85,12 @@ RESULT_COLUMNS = tuple(
     column
     for _, suffix, _ in STRATEGIES
     for column in (
-        f"T_{suffix}", f"T1_{suffix}", f"T2_{suffix}",
-        f"deadhead_{suffix}", f"overlap_{suffix}", f"turns_{suffix}",
+        f"axis_{suffix}", f"T_{suffix}", f"T1_{suffix}", f"T2_{suffix}",
+        f"work_{suffix}", f"deadhead_{suffix}", f"overlap_{suffix}",
+        f"uncovered_{suffix}", f"coverage_{suffix}", f"turns_{suffix}",
         f"delay_{suffix}", f"status_{suffix}",
     )
-) + ("Winner", "Winner_time")
+) + ("Winner", "Winner_axis", "Winner_time")
 
 
 def strategy_display_name(plan_name: str) -> str:
@@ -142,6 +151,27 @@ def optional_number(row: pd.Series, name: str, default: float,
     return number(row, name, positive=positive)
 
 
+def optional_bool(row: pd.Series, name: str, default: bool = False) -> bool:
+    """Прочитать необязательный логический параметр из XLSX или формы."""
+
+    if name not in row:
+        return default
+    raw_value = cast(Any, row[name])
+    if cast(bool, pd.isna(raw_value)):
+        return default
+    if isinstance(raw_value, bool):
+        return raw_value
+    if isinstance(raw_value, (int, float)):
+        if float(raw_value) in {0.0, 1.0}:
+            return bool(raw_value)
+    text_value = str(raw_value).strip().lower()
+    if text_value in {"1", "true", "yes", "да"}:
+        return True
+    if text_value in {"0", "false", "no", "нет"}:
+        return False
+    raise ValueError(f"поле {name!r} должно содержать да/нет или 1/0")
+
+
 def comparison_sign(first: float, second: float) -> str:
     """Вернуть знак отношения фактических числовых значений."""
 
@@ -161,9 +191,20 @@ def geometry_from_row(row: pd.Series) -> FieldGeometry:
     turn_zone = optional_number(
         row, "turn_zone_width", TURN_ZONE_WIDTH, positive=True
     )
+    allowed_gap_percent = optional_number(row, "allowed_gap_percent", 0.0)
+    return_to_start = optional_bool(row, "return_to_start", False)
+    if not 0.0 <= allowed_gap_percent <= 100.0:
+        raise ValueError("поле 'allowed_gap_percent' должно быть от 0 до 100")
     if 2.0 * turn_zone >= min(field_x, field_y):
         raise ValueError("две разворотные зоны должны быть уже каждой стороны поля")
-    return FieldGeometry(axis, field_x, field_y, turn_zone)
+    return FieldGeometry(
+        axis,
+        field_x,
+        field_y,
+        turn_zone,
+        allowed_gap_percent / 100.0,
+        return_to_start,
+    )
 
 
 def machine_from_row(row: pd.Series, index: int,
@@ -214,14 +255,39 @@ def plan_value(plan: Plan, attribute: str, digits: int = 1) -> float | None:
 
 
 def evaluate_scenario(row: pd.Series) -> ScenarioEvaluation:
-    """Рассчитать стратегии, знаки сравнения и лучший план сценария."""
+    """Рассчитать базовый и улучшенные планы с выбором направления."""
 
-    geometry = geometry_from_row(row)
+    baseline_geometry = geometry_from_row(row)
     machines = (
-        machine_from_row(row, 1, geometry),
-        machine_from_row(row, 2, geometry),
+        machine_from_row(row, 1, baseline_geometry),
+        machine_from_row(row, 2, baseline_geometry),
     )
-    plans = evaluate_strategies(geometry, machines)
+    geometries = {
+        axis: FieldGeometry(
+            axis,
+            baseline_geometry.field_x,
+            baseline_geometry.field_y,
+            baseline_geometry.turn_zone_width,
+            baseline_geometry.allowed_gap_fraction,
+            baseline_geometry.return_to_start,
+        )
+        for axis in ("x", "y")
+    }
+    evaluated = {
+        axis: evaluate_strategies(geometry, machines)
+        for axis, geometry in geometries.items()
+    }
+    plans: dict[str, Plan] = {
+        "1_Пополам": evaluated[baseline_geometry.axis]["1_Пополам"]
+    }
+    for plan_name in ("2_Полосами", "3_По_производительности"):
+        best_plan: Plan | None = None
+        for axis in ("x", "y"):
+            candidate = evaluated[axis][plan_name]
+            if plan_is_better(candidate, best_plan):
+                best_plan = candidate
+        plans[plan_name] = best_plan or evaluated[baseline_geometry.axis][plan_name]
+
     winner: Plan | None = None
     for plan in plans.values():
         if plan.valid and plan_is_better(plan, winner):
@@ -235,11 +301,15 @@ def evaluate_scenario(row: pd.Series) -> ScenarioEvaluation:
     }
     for plan_name, suffix, _ in STRATEGIES:
         plan = plans[plan_name]
+        result[f"axis_{suffix}"] = plan.axis.upper() if plan.axis else None
         result[f"T_{suffix}"] = plan_value(plan, "makespan")
         result[f"T1_{suffix}"] = plan_value(plan, "time_1")
         result[f"T2_{suffix}"] = plan_value(plan, "time_2")
+        result[f"work_{suffix}"] = plan_value(plan, "work_distance")
         result[f"deadhead_{suffix}"] = plan_value(plan, "deadhead")
         result[f"overlap_{suffix}"] = plan_value(plan, "overlap_area")
+        result[f"uncovered_{suffix}"] = plan_value(plan, "uncovered_area")
+        result[f"coverage_{suffix}"] = plan_value(plan, "coverage_percent", 2)
         result[f"turns_{suffix}"] = plan_value(plan, "turns", 0)
         result[f"delay_{suffix}"] = (
             round(max(plan.delay_1, plan.delay_2)) if plan.valid else None
@@ -247,7 +317,9 @@ def evaluate_scenario(row: pd.Series) -> ScenarioEvaluation:
         result[f"status_{suffix}"] = plan.status
     result["Winner"] = winner.name if winner else "Нет допустимой стратегии"
     result["Winner_time"] = round(winner.makespan, 1) if winner else None
-    return ScenarioEvaluation(result, plans, winner, geometry)
+    result["Winner_axis"] = winner.axis.upper() if winner else None
+    winner_geometry = geometries[winner.axis] if winner else baseline_geometry
+    return ScenarioEvaluation(result, plans, winner, winner_geometry)
 
 
 def check_scenario(row: pd.Series) -> dict[str, object]:
@@ -408,9 +480,7 @@ class RouteCanvas(QWidget):
         image = QImage(1800, 1100, QImage.Format.Format_ARGB32)
         image.fill(QColor("#f8fafc"))
         painter = QPainter(image)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.scale(1800.0 / max(1, self.width()), 1100.0 / max(1, self.height()))
-        self.render(painter)
+        self._draw_scene(painter, 1800.0, 1100.0)
         painter.end()
         return image.save(str(output_path), "PNG")
 
@@ -423,11 +493,16 @@ class RouteCanvas(QWidget):
     def paintEvent(self, event: object) -> None:  # noqa: N802
         del event
         painter = QPainter(self)
+        self._draw_scene(painter, float(self.width()), float(self.height()))
+        painter.end()
+
+    def _draw_scene(self, painter: QPainter,
+                    canvas_width: float, canvas_height: float) -> None:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        background = QLinearGradient(0.0, 0.0, 0.0, float(self.height()))
+        background = QLinearGradient(0.0, 0.0, 0.0, canvas_height)
         background.setColorAt(0.0, QColor("#ffffff"))
         background.setColorAt(1.0, QColor("#f1f5f9"))
-        painter.fillRect(self.rect(), background)
+        painter.fillRect(QRectF(0.0, 0.0, canvas_width, canvas_height), background)
 
         title_font = QFont("Segoe UI", 12, QFont.Weight.DemiBold)
         label_font = QFont("Segoe UI", 9)
@@ -438,7 +513,7 @@ class RouteCanvas(QWidget):
 
         geometry = self.field_geometry
         if geometry is None:
-            panel = QRectF(24.0, 52.0, self.width() - 48.0, self.height() - 76.0)
+            panel = QRectF(24.0, 52.0, canvas_width - 48.0, canvas_height - 76.0)
             painter.setPen(QPen(QColor("#cbd5e1"), 1.5, Qt.PenStyle.DashLine))
             painter.setBrush(QColor("#ffffff"))
             painter.drawRoundedRect(panel, 14.0, 14.0)
@@ -465,8 +540,8 @@ class RouteCanvas(QWidget):
         left_margin = 76.0
         right_margin = 34.0
         bottom_margin = 68.0
-        available_width = max(1.0, self.width() - left_margin - right_margin)
-        available_height = max(1.0, self.height() - top_margin - bottom_margin)
+        available_width = max(1.0, canvas_width - left_margin - right_margin)
+        available_height = max(1.0, canvas_height - top_margin - bottom_margin)
         scale = min(
             available_width / geometry.field_x,
             available_height / geometry.field_y,
@@ -613,9 +688,26 @@ class RouteCanvas(QWidget):
         )
 
 
+class NumericInput(QDoubleSpinBox):
+    """Числовое поле без стрелок и случайного изменения колесом мыши."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.setMinimumWidth(96)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+
+    def wheelEvent(self, event: QWheelEvent | None) -> None:  # noqa: N802
+        if event is not None:
+            event.ignore()
+
+
 def make_spin(value: float, *, minimum: float = 0.001,
               maximum: float = 100000.0, decimals: int = 3) -> QDoubleSpinBox:
-    spin = QDoubleSpinBox()
+    spin = NumericInput()
     spin.setRange(minimum, maximum)
     spin.setDecimals(decimals)
     spin.setValue(value)
@@ -627,6 +719,7 @@ def make_spin(value: float, *, minimum: float = 0.001,
 def make_page_header(title: str, subtitle: str) -> QFrame:
     frame = QFrame()
     frame.setObjectName("pageHeader")
+    frame.setFixedHeight(92)
     title_label = QLabel(title)
     title_label.setObjectName("pageTitle")
     subtitle_label = QLabel(subtitle)
@@ -668,6 +761,35 @@ def make_section_title(text: str) -> QLabel:
     label = QLabel(text)
     label.setObjectName("sectionTitle")
     return label
+
+
+def show_dialog(parent: QWidget, icon: QMessageBox.Icon,
+                title: str, message: str) -> None:
+    """Показать светлое диалоговое окно с гарантированно читаемым текстом."""
+
+    dialog = QMessageBox(parent)
+    dialog.setIcon(icon)
+    dialog.setWindowTitle(title)
+    dialog.setText(title)
+    dialog.setInformativeText(message)
+    dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+    dialog.setStyleSheet(
+        """
+        QMessageBox { background: #ffffff; }
+        QMessageBox QLabel {
+            color: #111827; background: transparent;
+            font-family: "Segoe UI"; font-size: 11pt;
+        }
+        QMessageBox QLabel#qt_msgbox_label,
+        QMessageBox QLabel#qt_msgbox_informativelabel { min-width: 440px; }
+        QMessageBox QPushButton {
+            min-width: 100px; min-height: 34px; background: #2563eb;
+            color: white; border: none; border-radius: 6px; font-weight: 700;
+        }
+        QMessageBox QPushButton:hover { background: #1d4ed8; }
+        """
+    )
+    dialog.exec()
 
 
 class TableTab(QWidget):
@@ -782,7 +904,9 @@ class TableTab(QWidget):
             self.show_preview(self.frame)
             self.log.setPlainText("Таблица загружена. Все строки будут проверены.")
         except Exception as error:  # noqa: BLE001
-            QMessageBox.critical(self, "Ошибка загрузки", str(error))
+            show_dialog(
+                self, QMessageBox.Icon.Critical, "Ошибка загрузки", str(error)
+            )
 
     def choose_output(self) -> None:
         filename, _ = QFileDialog.getSaveFileName(
@@ -818,8 +942,9 @@ class TableTab(QWidget):
             self.input_path is not None
             and self.input_path.resolve() == self.output_path.resolve()
         ):
-            QMessageBox.warning(
+            show_dialog(
                 self,
+                QMessageBox.Icon.Warning,
                 "Нельзя перезаписать исходник",
                 "Выберите для результата другой XLSX-файл.",
             )
@@ -858,7 +983,7 @@ class TableTab(QWidget):
     def calculation_failed(self, message: str) -> None:
         self.log.setPlainText(f"Ошибка: {message}")
         self.run_button.setEnabled(True)
-        QMessageBox.critical(self, "Ошибка расчёта", message)
+        show_dialog(self, QMessageBox.Icon.Critical, "Ошибка расчёта", message)
 
     def thread_finished(self) -> None:
         self.worker = None
@@ -867,13 +992,13 @@ class TableTab(QWidget):
 
 class SingleTab(QWidget):
     MACHINE_FIELDS = (
-        ("l", "Ширина захвата, м"),
-        ("U", "Рабочая скорость, м/с"),
-        ("Vtravel", "Скорость переезда, м/с"),
-        ("Vturn", "Скорость разворота, м/с"),
-        ("hx", "Длина машины, м"),
-        ("hy", "Ширина машины, м"),
-        ("R", "Радиус разворота, м"),
+        ("l", "Захват, м"),
+        ("U", "Раб. скорость, м/с"),
+        ("Vtravel", "Переезд, м/с"),
+        ("Vturn", "Разворот, м/с"),
+        ("hx", "Длина, м"),
+        ("hy", "Ширина, м"),
+        ("R", "Радиус поворота, м"),
         ("coord_x", "Старт X, м"),
         ("coord_y", "Старт Y, м"),
         ("orient", "Ориентация, °"),
@@ -890,68 +1015,125 @@ class SingleTab(QWidget):
         self.axis = QComboBox()
         self.axis.addItem("Вдоль X", "x")
         self.axis.addItem("Вдоль Y", "y")
+        self.axis.setMinimumWidth(96)
+        self.axis.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
         self.field_x = make_spin(FIELD_X)
         self.field_y = make_spin(FIELD_Y)
         self.turn_zone = make_spin(TURN_ZONE_WIDTH)
-        field_form = QFormLayout()
-        field_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        field_form.setHorizontalSpacing(16)
-        field_form.setVerticalSpacing(9)
-        field_form.addRow("Направление проходов:", self.axis)
-        field_form.addRow("Размер поля X, м:", self.field_x)
-        field_form.addRow("Размер поля Y, м:", self.field_y)
-        field_form.addRow("Ширина разворотной зоны, м:", self.turn_zone)
-        field_group = QGroupBox("Поле")
-        field_group.setLayout(field_form)
+        self.allowed_gap = make_spin(
+            0.0,
+            minimum=0.0,
+            maximum=100.0,
+            decimals=2,
+        )
+        self.finish_mode = QComboBox()
+        self.finish_mode.addItem("Остановка у границы", False)
+        self.finish_mode.addItem("Возврат к старту", True)
+        self.finish_mode.setMinimumWidth(96)
+        self.finish_mode.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        field_header = QLabel("Поле")
+        field_header.setObjectName("groupHeader")
+        field_header.setProperty("accent", "field")
+        field_header.setFixedHeight(36)
+        field_grid = QGridLayout()
+        field_grid.setContentsMargins(0, 0, 0, 0)
+        field_grid.setHorizontalSpacing(10)
+        field_grid.setVerticalSpacing(4)
+        field_values = (
+            ("Базовое направление", self.axis),
+            ("Размер поля X, м", self.field_x),
+            ("Размер поля Y, м", self.field_y),
+            ("Ширина разворотной зоны, м", self.turn_zone),
+            ("Допустимые пропуски, %", self.allowed_gap),
+            ("Завершение маршрута", self.finish_mode),
+        )
+        for item_index, (label_text, editor) in enumerate(field_values):
+            column = item_index % 2
+            label_row = (item_index // 2) * 2
+            label = QLabel(label_text)
+            label.setObjectName("compactLabel")
+            field_grid.addWidget(label, label_row, column)
+            field_grid.addWidget(editor, label_row + 1, column)
+            field_grid.setColumnStretch(column, 1)
+        field_layout = QVBoxLayout()
+        field_layout.setSpacing(8)
+        field_layout.addWidget(field_header)
+        field_layout.addLayout(field_grid)
+        field_group = QGroupBox()
+        field_group.setObjectName("fieldGroup")
+        field_group.setLayout(field_layout)
 
         defaults = {
             1: (6.0, 2.0, 2.5, 1.5, 5.0, 3.0, 2.5, 0.0, 3.0, 0.0),
             2: (6.0, 2.0, 2.5, 1.5, 5.0, 3.0, 2.5, 0.0, 117.0, 0.0),
         }
-        machines_layout = QVBoxLayout()
+        machines_layout = QHBoxLayout()
+        machines_layout.setSpacing(10)
         for machine_index in (1, 2):
-            form = QFormLayout()
-            form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-            form.setHorizontalSpacing(14)
-            form.setVerticalSpacing(8)
-            for (field_name, label), value in zip(
+            machine_grid = QGridLayout()
+            machine_grid.setContentsMargins(0, 0, 0, 0)
+            machine_grid.setHorizontalSpacing(10)
+            machine_grid.setVerticalSpacing(4)
+            machine_header = QLabel(f"Машина {machine_index}")
+            machine_header.setObjectName("groupHeader")
+            machine_header.setProperty("accent", f"machine{machine_index}")
+            machine_header.setFixedHeight(36)
+            for item_index, ((field_name, label), value) in enumerate(zip(
                 self.MACHINE_FIELDS, defaults[machine_index], strict=True
-            ):
+            )):
                 minimum = -360.0 if field_name == "orient" else 0.0
                 spin = make_spin(value, minimum=minimum)
+                spin.setFixedHeight(28)
                 if field_name == "orient":
                     spin.setMaximum(360.0)
                 self.inputs[f"{field_name}{machine_index}"] = spin
-                form.addRow(f"{label}:", spin)
-            group = QGroupBox(f"Машина {machine_index}")
+                column = item_index % 2
+                label_row = (item_index // 2) * 2
+                input_label = QLabel(label)
+                input_label.setObjectName("compactLabel")
+                machine_grid.addWidget(input_label, label_row, column)
+                machine_grid.addWidget(spin, label_row + 1, column)
+                machine_grid.setColumnStretch(column, 1)
+            machine_layout = QVBoxLayout()
+            machine_layout.setSpacing(8)
+            machine_layout.addWidget(machine_header)
+            machine_layout.addLayout(machine_grid)
+            group = QGroupBox()
             group.setObjectName(f"machine{machine_index}")
-            group.setLayout(form)
+            group.setLayout(machine_layout)
             machines_layout.addWidget(group)
 
-        self.compare_label = QLabel("Сравнение параметров появится после расчёта")
-        self.compare_label.setObjectName("comparisonBadge")
-        self.compare_label.setWordWrap(True)
         self.winner_label = QLabel("Лучший план ещё не рассчитан")
         self.winner_label.setWordWrap(True)
         self.winner_label.setObjectName("winnerCard")
-        self.results = QTableWidget(3, 9)
+        self.results = QTableWidget(3, 7)
         self.results.setObjectName("resultTable")
         self.results.setMinimumHeight(175)
         self.results.setHorizontalHeaderLabels(
             [
-                "Стратегия", "Статус", "Общее время", "Машина 1", "Машина 2",
-                "Развороты", "Задержка", "Порожний путь", "Перекрытие",
+                "Стратег.",
+                "Статус",
+                "Итог, с",
+                "М1/М2, с",
+                "Раб./пер.",
+                "Повор./зад.",
+                "Перекр./пр.",
             ]
         )
         self.results.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.results.setAlternatingRowColors(True)
         self.results.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.results.setWordWrap(False)
+        self.results.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         results_header = self.results.horizontalHeader()
         if results_header is not None:
-            results_header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
-        for column, width in enumerate((175, 190, 105, 92, 92, 92, 88, 120, 110)):
-            self.results.setColumnWidth(column, width)
+            results_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         results_vertical_header = self.results.verticalHeader()
         if results_vertical_header is not None:
             results_vertical_header.setVisible(False)
@@ -973,31 +1155,22 @@ class SingleTab(QWidget):
         buttons.addWidget(self.save_image_button)
         buttons.addStretch()
 
-        inputs_widget = QWidget()
-        inputs_layout = QVBoxLayout(inputs_widget)
-        inputs_layout.setContentsMargins(4, 4, 4, 4)
-        inputs_layout.setSpacing(12)
-        inputs_layout.addWidget(field_group)
-        inputs_layout.addLayout(machines_layout)
-        inputs_layout.addWidget(self.compare_label)
-        inputs_layout.addLayout(buttons)
-        input_scroll = QScrollArea()
-        input_scroll.setWidgetResizable(True)
-        input_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        input_scroll.setWidget(inputs_widget)
-
         input_card, input_card_layout = make_card()
+        input_card.setMinimumWidth(620)
         input_card_layout.addWidget(make_section_title("Числовые параметры"))
         input_hint = QLabel(
-            "Все значения вводятся числами. Знаки сравнения между машинами "
-            "приложение определит автоматически."
+            "Базовый план использует выбранное направление; улучшенные планы "
+            "автоматически сравнивают X и Y."
         )
         input_hint.setObjectName("mutedText")
         input_hint.setWordWrap(True)
         input_card_layout.addWidget(input_hint)
-        input_card_layout.addWidget(input_scroll)
+        input_card_layout.addWidget(field_group)
+        input_card_layout.addLayout(machines_layout, 1)
+        input_card_layout.addLayout(buttons)
 
         result_card, result_layout = make_card()
+        result_card.setMinimumWidth(500)
         result_layout.addWidget(make_section_title("Результат и выбранный маршрут"))
         result_layout.addWidget(self.winner_label)
         result_layout.addWidget(self.results)
@@ -1008,7 +1181,7 @@ class SingleTab(QWidget):
         splitter.addWidget(result_card)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([500, 900])
+        splitter.setSizes([680, 720])
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(14)
@@ -1028,6 +1201,8 @@ class SingleTab(QWidget):
             "field_x": self.field_x.value(),
             "field_y": self.field_y.value(),
             "turn_zone_width": self.turn_zone.value(),
+            "allowed_gap_percent": self.allowed_gap.value(),
+            "return_to_start": bool(self.finish_mode.currentData()),
         }
         for machine_index in (1, 2):
             for field_name, _ in self.MACHINE_FIELDS:
@@ -1070,18 +1245,24 @@ class SingleTab(QWidget):
             return
         self.current_evaluation = value
         result = value.result
-        self.compare_label.setText(
-            "Сравнение: "
-            f"захват {result['cond_l']}; скорость {result['cond_U']}; "
-            f"длина {result['cond_hx']}; ширина {result['cond_hy']}"
-        )
+
+        def pair_text(first: object, second: object) -> str:
+            left = "—" if first is None else str(first)
+            right = "—" if second is None else str(second)
+            return f"{left} / {right}"
+
         for row_index, (plan_name, suffix, label) in enumerate(STRATEGIES):
             plan = value.plans[plan_name]
+            short_label = "По производит." if label == "По производительности" else label
+            table_label = f"{short_label} ({plan.axis.upper()})"
             cells = (
-                label, plan.status, result[f"T_{suffix}"], result[f"T1_{suffix}"],
-                result[f"T2_{suffix}"], result[f"turns_{suffix}"],
-                result[f"delay_{suffix}"], result[f"deadhead_{suffix}"],
-                result[f"overlap_{suffix}"],
+                table_label,
+                plan.status,
+                result[f"T_{suffix}"],
+                pair_text(result[f"T1_{suffix}"], result[f"T2_{suffix}"]),
+                pair_text(result[f"work_{suffix}"], result[f"deadhead_{suffix}"]),
+                pair_text(result[f"turns_{suffix}"], result[f"delay_{suffix}"]),
+                pair_text(result[f"overlap_{suffix}"], result[f"uncovered_{suffix}"]),
             )
             for column_index, cell in enumerate(cells):
                 item = QTableWidgetItem("—" if cell is None else str(cell))
@@ -1097,7 +1278,9 @@ class SingleTab(QWidget):
         else:
             self.winner_label.setText(
                 f"Лучший план: {strategy_display_name(winner.name)}; "
-                f"время завершения: {winner.makespan:.1f} с"
+                f"направление {winner.axis.upper()}; "
+                f"время завершения: {winner.makespan:.1f} с; "
+                f"покрытие: {winner.coverage_percent:.2f}%"
             )
         self.canvas.set_route(winner, value.geometry)
         self.calculate_button.setEnabled(True)
@@ -1110,7 +1293,7 @@ class SingleTab(QWidget):
         self.calculate_button.setEnabled(True)
         self.save_button.setEnabled(False)
         self.save_image_button.setEnabled(False)
-        QMessageBox.critical(self, "Ошибка расчёта", message)
+        show_dialog(self, QMessageBox.Icon.Critical, "Ошибка расчёта", message)
 
     def thread_finished(self) -> None:
         self.worker = None
@@ -1129,9 +1312,16 @@ class SingleTab(QWidget):
             path = path.with_suffix(".xlsx")
         try:
             save_private_report(self.current_row, self.current_evaluation, path)
-            QMessageBox.information(self, "Отчёт сохранён", f"Файл сохранён:\n{path}")
+            show_dialog(
+                self,
+                QMessageBox.Icon.Information,
+                "Отчёт сохранён",
+                f"Файл сохранён:\n{path}",
+            )
         except Exception as error:  # noqa: BLE001
-            QMessageBox.critical(self, "Ошибка сохранения", str(error))
+            show_dialog(
+                self, QMessageBox.Icon.Critical, "Ошибка сохранения", str(error)
+            )
 
     def save_image(self) -> None:
         if self.current_evaluation is None or self.current_evaluation.winner is None:
@@ -1148,18 +1338,26 @@ class SingleTab(QWidget):
         if path.suffix.lower() != ".png":
             path = path.with_suffix(".png")
         if self.canvas.save_png(path):
-            QMessageBox.information(
-                self, "Схема сохранена", f"Изображение сохранено:\n{path}"
+            show_dialog(
+                self,
+                QMessageBox.Icon.Information,
+                "Схема сохранена",
+                f"Изображение сохранено:\n{path}",
             )
         else:
-            QMessageBox.critical(self, "Ошибка сохранения", "Не удалось сохранить PNG")
+            show_dialog(
+                self,
+                QMessageBox.Icon.Critical,
+                "Ошибка сохранения",
+                "Не удалось сохранить PNG",
+            )
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Inagrika — планировщик уборки")
-        self.setMinimumSize(1180, 780)
+        self.setMinimumSize(1280, 900)
         self.resize(1440, 960)
         tabs = QTabWidget()
         tabs.setObjectName("mainTabs")
@@ -1202,13 +1400,17 @@ def configure_application(app: QApplication) -> None:
         }
         QLabel#sectionTitle { font-size: 14px; font-weight: 700; color: #172554; }
         QLabel#mutedText { color: #64748b; }
+        QLabel#compactLabel { color: #334155; font-size: 9pt; font-weight: 500; }
+        QLabel#groupHeader {
+            color: white; border-radius: 6px; padding: 8px 12px;
+            font-size: 13px; font-weight: 700;
+        }
+        QLabel#groupHeader[accent="field"] { background: #0f766e; }
+        QLabel#groupHeader[accent="machine1"] { background: #be123c; }
+        QLabel#groupHeader[accent="machine2"] { background: #1d4ed8; }
         QLabel#badge {
             background: #e0f2fe; color: #075985; border: 1px solid #bae6fd;
             border-radius: 12px; padding: 5px 11px; font-weight: 600;
-        }
-        QLabel#comparisonBadge {
-            background: #eff6ff; color: #1e3a8a; border: 1px solid #bfdbfe;
-            border-radius: 7px; padding: 9px 12px; font-weight: 600;
         }
         QLabel#winnerCard {
             background: #ecfdf5; color: #14532d; border: 1px solid #a7f3d0;
@@ -1217,11 +1419,7 @@ def configure_application(app: QApplication) -> None:
         }
         QGroupBox {
             font-weight: 700; border: 1px solid #cbd5e1; border-radius: 8px;
-            margin-top: 12px; padding: 12px 10px 10px 10px; background: #f8fafc;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin; subcontrol-position: top left;
-            left: 12px; padding: 0 6px; color: #334155;
+            margin-top: 0; padding: 9px; background: #f8fafc;
         }
         QGroupBox#machine1 { border-top: 3px solid #e11d48; }
         QGroupBox#machine2 { border-top: 3px solid #2563eb; }
@@ -1236,9 +1434,17 @@ def configure_application(app: QApplication) -> None:
             background: #ffffff; color: #1e3a8a; border: 1px solid #93c5fd;
         }
         QPushButton[variant="secondary"]:hover { background: #eff6ff; }
-        QLineEdit, QDoubleSpinBox, QComboBox, QTextEdit {
+        QLineEdit, QComboBox, QTextEdit {
             min-height: 34px; background: #ffffff; border: 1px solid #cbd5e1;
             border-radius: 6px; padding: 2px 8px; selection-background-color: #bfdbfe;
+        }
+        QDoubleSpinBox {
+            background: #ffffff; border: 1px solid #cbd5e1;
+            border-radius: 6px; padding: 1px 8px;
+            selection-background-color: #bfdbfe;
+        }
+        QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+            width: 0; height: 0; border: none; background: transparent;
         }
         QLineEdit:focus, QDoubleSpinBox:focus, QComboBox:focus, QTextEdit:focus {
             border: 2px solid #60a5fa;
@@ -1289,3 +1495,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

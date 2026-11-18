@@ -22,6 +22,7 @@ HEADER_VARIANTS = {"=": BASE_HEADER, ">": 8.0, "<": 4.5}
 SPEED_VARIANTS = {"=": BASE_WORK_SPEED, ">": 3.0, "<": 1.5}
 LENGTH_VARIANTS = {"=": BASE_LENGTH, ">": 6.0, "<": 4.0}
 WIDTH_VARIANTS = {"=": BASE_WIDTH, ">": 3.5, "<": 2.5}
+ALLOWED_GAP_PERCENT = 0.0
 
 
 def condition_values(condition: tuple[str, str, str, str]) -> tuple[float, ...]:
@@ -87,6 +88,8 @@ def generate_scenarios() -> pd.DataFrame:
                     "field_x": FIELD_X,
                     "field_y": FIELD_Y,
                     "turn_zone_width": TURN_ZONE_WIDTH,
+                    "allowed_gap_percent": ALLOWED_GAP_PERCENT,
+                    "return_to_start": False,
                     "cond_l": header_relation,
                     "cond_U": speed_relation,
                     "cond_hx": length_relation,
@@ -118,6 +121,92 @@ def generate_scenarios() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def required_scenario_row(
+    scenario_id: str,
+    *,
+    field_x: float,
+    field_y: float,
+    speed_1: float = BASE_WORK_SPEED,
+    speed_2: float = BASE_WORK_SPEED,
+    description: str,
+) -> dict[str, object]:
+    """Сформировать один обязательный сценарий А–Г из таблицы задания."""
+
+    header_1 = header_2 = BASE_HEADER
+    start_1 = (0.0, header_1 / 2.0)
+    start_2 = (0.0, field_y - header_2 / 2.0)
+    machine_1 = make_machine(
+        header_1, speed_1, BASE_LENGTH, BASE_WIDTH, start_1, 0.0
+    )
+    machine_2 = make_machine(
+        header_2, speed_2, BASE_LENGTH, BASE_WIDTH, start_2, 0.0
+    )
+    return {
+        "scenario_id": scenario_id,
+        "description": description,
+        "s": "x",
+        "field_x": field_x,
+        "field_y": field_y,
+        "turn_zone_width": TURN_ZONE_WIDTH,
+        "allowed_gap_percent": ALLOWED_GAP_PERCENT,
+        "return_to_start": False,
+        "l1": header_1,
+        "l2": header_2,
+        "U1": speed_1,
+        "U2": speed_2,
+        "Vtravel1": machine_1.travel_speed,
+        "Vtravel2": machine_2.travel_speed,
+        "Vturn1": machine_1.turn_speed,
+        "Vturn2": machine_2.turn_speed,
+        "hx1": BASE_LENGTH,
+        "hy1": BASE_WIDTH,
+        "hx2": BASE_LENGTH,
+        "hy2": BASE_WIDTH,
+        "R1": machine_1.turn_radius,
+        "R2": machine_2.turn_radius,
+        "coord1_x": start_1[0],
+        "coord1_y": start_1[1],
+        "coord2_x": start_2[0],
+        "coord2_y": start_2[1],
+        "orient1": 0.0,
+        "orient2": 0.0,
+    }
+
+
+def generate_required_scenarios() -> pd.DataFrame:
+    """Сформировать обязательные сценарии А–Г из таблицы 1 задания."""
+
+    rows = [
+        required_scenario_row(
+            "А",
+            field_x=240.0,
+            field_y=120.0,
+            description="Одинаковые машины",
+        ),
+        required_scenario_row(
+            "Б",
+            field_x=120.0,
+            field_y=240.0,
+            description="Выбор направления при фиксированных правилах старта",
+        ),
+        required_scenario_row(
+            "В",
+            field_x=240.0,
+            field_y=120.0,
+            speed_1=2.0,
+            speed_2=1.5,
+            description="Вторая машина медленнее первой",
+        ),
+        required_scenario_row(
+            "Г",
+            field_x=250.0,
+            field_y=130.0,
+            description="Размеры поля не кратны ширине захвата",
+        ),
+    ]
+    return pd.DataFrame(rows)
+
+
 def save_xlsx(frame: pd.DataFrame, output_path: Path) -> Path:
     """Сохранить таблицу в XLSX и вернуть её путь."""
 
@@ -138,6 +227,12 @@ def parse_args() -> argparse.Namespace:
         default=Path("synthetic_scenarios.xlsx"),
         help="выходной файл .xlsx",
     )
+    parser.add_argument(
+        "--required-output",
+        type=Path,
+        default=Path("required_scenarios.xlsx"),
+        help="выходной XLSX с обязательными сценариями А–Г",
+    )
     return parser.parse_args()
 
 
@@ -145,8 +240,11 @@ def main() -> None:
     args = parse_args()
     scenarios = generate_scenarios()
     output_path = save_xlsx(scenarios, args.output)
+    required = generate_required_scenarios()
+    required_output = save_xlsx(required, args.required_output)
     print(f"Сформировано сценариев: {len(scenarios)}")
     print(f"Исходные данные сохранены: {output_path}")
+    print(f"Сценарии А–Г сохранены: {required_output}")
 
 
 if __name__ == "__main__":

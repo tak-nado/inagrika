@@ -63,6 +63,8 @@ class FieldGeometry:
     field_x: float = FIELD_X
     field_y: float = FIELD_Y
     turn_zone_width: float = TURN_ZONE_WIDTH
+    allowed_gap_fraction: float = 0.0
+    return_to_start: bool = False
 
     @property
     def run_length(self) -> float:
@@ -131,6 +133,7 @@ class Plan:
     """
 
     name: str
+    axis: str = ""
     valid: bool = False
     status: str = "нет допустимого маршрута"
     makespan: float = math.inf
@@ -138,8 +141,11 @@ class Plan:
     time_2: float = math.inf
     delay_1: float = 0.0
     delay_2: float = 0.0
+    work_distance: float = math.inf
     deadhead: float = math.inf
     overlap_area: float = math.inf
+    uncovered_area: float = math.inf
+    coverage_percent: float = 0.0
     turns: int = 0
     route_1: Route | None = None
     route_2: Route | None = None
@@ -405,6 +411,93 @@ def perimeter_path(start: Point, entry: Point, geometry: FieldGeometry,
     return [(edge, start[1]), (edge, opposite_y), outer_entry, entry]
 
 
+def point_on_boundary(point: Point, geometry: FieldGeometry) -> bool:
+    """Проверить, лежит ли точка на внешней границе прямоугольного поля."""
+
+    x, y = point
+    return bool(
+        abs(x) <= EPS
+        or abs(x - geometry.field_x) <= EPS
+        or abs(y) <= EPS
+        or abs(y - geometry.field_y) <= EPS
+    )
+
+
+def boundary_coordinate(point: Point, geometry: FieldGeometry) -> float:
+    """Получить координату точки на периметре по часовой стрелке."""
+
+    x, y = point
+    width = geometry.field_x
+    height = geometry.field_y
+    if abs(y) <= EPS:
+        return min(width, max(0.0, x))
+    if abs(x - width) <= EPS:
+        return width + min(height, max(0.0, y))
+    if abs(y - height) <= EPS:
+        return width + height + (width - min(width, max(0.0, x)))
+    if abs(x) <= EPS:
+        return 2.0 * width + height + (height - min(height, max(0.0, y)))
+    raise ValueError("точка возврата должна находиться на границе поля")
+
+
+def boundary_point(coordinate: float, geometry: FieldGeometry) -> Point:
+    """Преобразовать координату периметра обратно в точку поля."""
+
+    width = geometry.field_x
+    height = geometry.field_y
+    perimeter = 2.0 * (width + height)
+    value = coordinate % perimeter
+    if value <= width:
+        return value, 0.0
+    value -= width
+    if value <= height:
+        return width, value
+    value -= height
+    if value <= width:
+        return width - value, height
+    value -= width
+    return 0.0, height - value
+
+
+def perimeter_return_path(start: Point, finish: Point,
+                          geometry: FieldGeometry) -> list[Point]:
+    """Построить кратчайший путь по внешней границе между двумя точками."""
+
+    if not point_on_boundary(start, geometry) or not point_on_boundary(
+        finish, geometry
+    ):
+        raise ValueError("возврат к старту возможен только для точки на границе")
+    start_value = boundary_coordinate(start, geometry)
+    finish_value = boundary_coordinate(finish, geometry)
+    perimeter = 2.0 * (geometry.field_x + geometry.field_y)
+    clockwise_distance = (finish_value - start_value) % perimeter
+    counter_distance = (start_value - finish_value) % perimeter
+    corners = (
+        0.0,
+        geometry.field_x,
+        geometry.field_x + geometry.field_y,
+        2.0 * geometry.field_x + geometry.field_y,
+        perimeter,
+    )
+
+    def clockwise(begin: float, end: float) -> list[Point]:
+        if end < begin:
+            end += perimeter
+        points = [
+            boundary_point(corner, geometry)
+            for lap in (0.0, perimeter)
+            for corner in corners[:-1]
+            if begin + EPS < corner + lap < end - EPS
+        ]
+        points.append(boundary_point(end, geometry))
+        return points
+
+    if clockwise_distance <= counter_distance:
+        return clockwise(start_value, start_value + clockwise_distance)
+    reverse_path = clockwise(finish_value, finish_value + counter_distance)
+    return list(reversed(reverse_path[:-1])) + [finish]
+
+
 def build_route(machine: Machine, geometry: FieldGeometry, passes: list[float],
                 reverse_order: bool, start_at_far_end: bool) -> Route | None:
     """Построить полный змееобразный маршрут одной машины.
@@ -448,6 +541,12 @@ def build_route(machine: Machine, geometry: FieldGeometry, passes: list[float],
     # Освобождаем рабочую и разворотную зоны после последнего прохода.
     final_parking = geometry.outer_point(ordered[-1], boundary)
     builder.move_to(final_parking, machine.travel_speed, "deadhead")
+    if geometry.return_to_start:
+        try:
+            return_path = perimeter_return_path(final_parking, machine.start, geometry)
+        except ValueError:
+            return None
+        builder.follow(return_path, machine.travel_speed, "deadhead")
 
     return Route(
         segments=builder.segments,
@@ -655,8 +754,54 @@ def plan_is_better(candidate: Plan, current: Plan | None) -> bool:
     return candidate.overlap_area < current.overlap_area
 
 
-def evaluate_assignment(name: str, geometry: FieldGeometry, machines: tuple[Machine, Machine],
-                        passes: tuple[list[float], list[float]], overlap_area: float) -> Plan:
+def coverage_metrics(
+    geometry: FieldGeometry,
+    machines: tuple[Machine, Machine],
+    passes: tuple[list[float], list[float]],
+) -> tuple[float, float, float]:
+    """Рассчитать перекрытие, пропуски и процент покрытия целевой площади."""
+
+    intervals: list[tuple[float, float]] = []
+    total_band_width = 0.0
+    for machine, machine_passes in zip(machines, passes, strict=True):
+        half_header = machine.header / 2.0
+        for center in machine_passes:
+            begin = max(0.0, center - half_header)
+            end = min(geometry.sweep_width, center + half_header)
+            if end <= begin + EPS:
+                continue
+            intervals.append((begin, end))
+            total_band_width += end - begin
+
+    covered_width = 0.0
+    if intervals:
+        intervals.sort()
+        current_begin, current_end = intervals[0]
+        for begin, end in intervals[1:]:
+            if begin <= current_end + EPS:
+                current_end = max(current_end, end)
+            else:
+                covered_width += current_end - current_begin
+                current_begin, current_end = begin, end
+        covered_width += current_end - current_begin
+
+    covered_width = min(geometry.sweep_width, max(0.0, covered_width))
+    uncovered_width = max(0.0, geometry.sweep_width - covered_width)
+    overlap_width = max(0.0, total_band_width - covered_width)
+    coverage_percent = (
+        100.0 if geometry.sweep_width <= EPS
+        else 100.0 * covered_width / geometry.sweep_width
+    )
+    return (
+        overlap_width * geometry.run_length,
+        uncovered_width * geometry.run_length,
+        coverage_percent,
+    )
+
+
+def evaluate_assignment(name: str, geometry: FieldGeometry,
+                        machines: tuple[Machine, Machine],
+                        passes: tuple[list[float], list[float]]) -> Plan:
     """Оценить конкретное распределение проходов между двумя машинами.
 
     Для каждой машины перебираются сторона входа и порядок полос. Для каждой
@@ -664,10 +809,35 @@ def evaluate_assignment(name: str, geometry: FieldGeometry, machines: tuple[Mach
     лучший допустимый план.
     """
 
+    overlap_area, uncovered_area, coverage_percent = coverage_metrics(
+        geometry, machines, passes
+    )
+    target_area = geometry.sweep_width * geometry.run_length
+    uncovered_fraction = 0.0 if target_area <= EPS else uncovered_area / target_area
+    if uncovered_fraction > geometry.allowed_gap_fraction + EPS:
+        return Plan(
+            name=name,
+            axis=geometry.axis,
+            status=(
+                f"пропуски {uncovered_fraction * 100.0:.2f}% превышают допуск "
+                f"{geometry.allowed_gap_fraction * 100.0:.2f}%"
+            ),
+            overlap_area=overlap_area,
+            uncovered_area=uncovered_area,
+            coverage_percent=coverage_percent,
+        )
+
     options_1 = route_options(machines[0], geometry, passes[0])
     options_2 = route_options(machines[1], geometry, passes[1])
     if not options_1 or not options_2:
-        return Plan(name=name, status="разворотная зона слишком узкая")
+        return Plan(
+            name=name,
+            axis=geometry.axis,
+            status="разворотная зона слишком узкая",
+            overlap_area=overlap_area,
+            uncovered_area=uncovered_area,
+            coverage_percent=coverage_percent,
+        )
 
     best: Plan | None = None
     for route_1 in options_1:
@@ -680,6 +850,7 @@ def evaluate_assignment(name: str, geometry: FieldGeometry, machines: tuple[Mach
             time_2 = delay_2 + route_2.duration
             candidate = Plan(
                 name=name,
+                axis=geometry.axis,
                 valid=True,
                 status="OK",
                 makespan=max(time_1, time_2),
@@ -687,8 +858,11 @@ def evaluate_assignment(name: str, geometry: FieldGeometry, machines: tuple[Mach
                 time_2=time_2,
                 delay_1=delay_1,
                 delay_2=delay_2,
+                work_distance=route_1.work_distance + route_2.work_distance,
                 deadhead=route_1.deadhead_distance + route_2.deadhead_distance,
                 overlap_area=overlap_area,
+                uncovered_area=uncovered_area,
+                coverage_percent=coverage_percent,
                 turns=route_1.turn_count + route_2.turn_count,
                 route_1=route_1,
                 route_2=route_2,
@@ -696,7 +870,14 @@ def evaluate_assignment(name: str, geometry: FieldGeometry, machines: tuple[Mach
             if plan_is_better(candidate, best):
                 best = candidate
 
-    return best or Plan(name=name, status="столкновение не устраняется задержкой")
+    return best or Plan(
+        name=name,
+        axis=geometry.axis,
+        status="столкновение не устраняется задержкой",
+        overlap_area=overlap_area,
+        uncovered_area=uncovered_area,
+        coverage_percent=coverage_percent,
+    )
 
 
 def region_passes(begin: float, width: float, header: float) -> list[float]:
@@ -730,15 +911,11 @@ def evaluate_contiguous(name: str, geometry: FieldGeometry,
             region_passes(begins[0], widths[0], machines[0].header),
             region_passes(begins[1], widths[1], machines[1].header),
         )
-        overlap = (
-            max(0.0, len(passes[0]) * machines[0].header - widths[0])
-            + max(0.0, len(passes[1]) * machines[1].header - widths[1])
-        ) * geometry.run_length
-        candidate = evaluate_assignment(name, geometry, machines, passes, overlap)
+        candidate = evaluate_assignment(name, geometry, machines, passes)
         if plan_is_better(candidate, best):
             best = candidate
 
-    return best or Plan(name=name)
+    return best or Plan(name=name, axis=geometry.axis)
 
 
 def alternating_passes(geometry: FieldGeometry, machines: tuple[Machine, Machine],
@@ -766,11 +943,11 @@ def evaluate_strips(geometry: FieldGeometry,
 
     best: Plan | None = None
     for first_machine in (0, 1):
-        passes, overlap = alternating_passes(geometry, machines, first_machine)
-        candidate = evaluate_assignment("2_Полосами", geometry, machines, passes, overlap)
+        passes, _ = alternating_passes(geometry, machines, first_machine)
+        candidate = evaluate_assignment("2_Полосами", geometry, machines, passes)
         if plan_is_better(candidate, best):
             best = candidate
-    return best or Plan(name="2_Полосами")
+    return best or Plan(name="2_Полосами", axis=geometry.axis)
 
 
 def evaluate_strategies(geometry: FieldGeometry,
