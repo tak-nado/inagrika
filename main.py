@@ -223,15 +223,15 @@ def machine_from_row(row: pd.Series, index: int,
     )
     start_x = number(row, f"coord{index}_x")
     start_y = number(row, f"coord{index}_y")
-    if not 0.0 <= start_x <= geometry.field_x:
+    if not 0.0 <= start_x <= geometry.total_x:
         raise ValueError(f"coord{index}_x должна находиться в пределах поля")
-    if not 0.0 <= start_y <= geometry.field_y:
+    if not 0.0 <= start_y <= geometry.total_y:
         raise ValueError(f"coord{index}_y должна находиться в пределах поля")
     if geometry.return_to_start and not (
         math.isclose(start_x, 0.0, abs_tol=1e-9)
-        or math.isclose(start_x, geometry.field_x, abs_tol=1e-9)
+        or math.isclose(start_x, geometry.total_x, abs_tol=1e-9)
         or math.isclose(start_y, 0.0, abs_tol=1e-9)
-        or math.isclose(start_y, geometry.field_y, abs_tol=1e-9)
+        or math.isclose(start_y, geometry.total_y, abs_tol=1e-9)
     ):
         raise ValueError(
             f"при возврате к старту coord{index}_x/coord{index}_y "
@@ -288,18 +288,8 @@ def evaluate_scenario(
     axes = tuple(
         axis
         for axis, geometry in candidate_geometries.items()
-        if geometry.run_length > 0.0
+        if all(geometry.contains(machine.start) for machine in machines)
     )
-    if not compare_axes and selected_geometry.axis not in axes:
-        raise ValueError(
-            "ширина двух разворотных зон должна быть меньше размера поля "
-            f"вдоль оси {selected_geometry.axis.upper()}"
-        )
-    if not axes:
-        raise ValueError(
-            "ширина двух разворотных зон должна быть меньше размера поля "
-            "хотя бы вдоль одного направления проходов"
-        )
     geometries = {axis: candidate_geometries[axis] for axis in axes}
     evaluated = {
         axis: evaluate_strategies(geometry, machines)
@@ -562,7 +552,8 @@ class RouteCanvas(QWidget):
 
         plan = self.plan
         subtitle = (
-            f"{strategy_display_name(plan.name)}  •  {plan.makespan:.1f} с"
+            f"{strategy_display_name(plan.name)}  •  {plan.makespan:.1f} с  •  "
+            f"рабочая часть {geometry.field_x:g} × {geometry.field_y:g} м"
             if plan is not None and plan.valid
             else "допустимый маршрут не найден"
         )
@@ -577,11 +568,11 @@ class RouteCanvas(QWidget):
         available_width = max(1.0, canvas_width - left_margin - right_margin)
         available_height = max(1.0, canvas_height - top_margin - bottom_margin)
         scale = min(
-            available_width / geometry.field_x,
-            available_height / geometry.field_y,
+            available_width / geometry.total_x,
+            available_height / geometry.total_y,
         )
-        field_width = geometry.field_x * scale
-        field_height = geometry.field_y * scale
+        field_width = geometry.total_x * scale
+        field_height = geometry.total_y * scale
         left = left_margin + (available_width - field_width) / 2.0
         top = top_margin + (available_height - field_height) / 2.0
         field_rect = QRectF(left, top, field_width, field_height)
@@ -606,8 +597,8 @@ class RouteCanvas(QWidget):
         painter.setPen(QColor("#475569"))
         for step in range(0, 11, 2):
             fraction = step / 10.0
-            x_value = geometry.field_x * fraction
-            y_value = geometry.field_y * fraction
+            x_value = geometry.total_x * fraction
+            y_value = geometry.total_y * fraction
             x = left + field_width * fraction
             y = top + field_height * (1.0 - fraction)
             painter.drawText(QRectF(x - 24.0, top + field_height + 7.0, 48.0, 18.0),
@@ -1073,7 +1064,7 @@ class SingleTab(QWidget):
             decimals=2,
         )
         self.finish_mode = QComboBox()
-        self.finish_mode.addItem("Остановка у границы", False)
+        self.finish_mode.addItem("Остановка в разворотной зоне", False)
         self.finish_mode.addItem("Возврат к старту", True)
         self.finish_mode.setMinimumWidth(96)
         self.finish_mode.setSizePolicy(
@@ -1091,8 +1082,8 @@ class SingleTab(QWidget):
         field_grid.setAlignment(Qt.AlignmentFlag.AlignTop)
         field_values = (
             ("Направление проходов", self.axis),
-            ("Размер поля X, м", self.field_x),
-            ("Размер поля Y, м", self.field_y),
+            ("Рабочая часть X, м", self.field_x),
+            ("Рабочая часть Y, м", self.field_y),
             ("Ширина разворотной зоны, м", self.turn_zone),
             ("Допустимые пропуски, %", self.allowed_gap),
             ("Завершение маршрута", self.finish_mode),
@@ -1170,6 +1161,8 @@ class SingleTab(QWidget):
 
         self.field_x.valueChanged.connect(self.update_coordinate_limits)
         self.field_y.valueChanged.connect(self.update_coordinate_limits)
+        self.turn_zone.valueChanged.connect(self.update_coordinate_limits)
+        self.axis.currentIndexChanged.connect(self.update_coordinate_limits)
         self.update_coordinate_limits()
 
         self.winner_label = QLabel("Лучший план ещё не рассчитан")
@@ -1226,8 +1219,9 @@ class SingleTab(QWidget):
         input_card.setMinimumWidth(640)
         input_card_layout.addWidget(make_section_title("Числовые параметры"))
         input_hint = QLabel(
-            "Выбранное направление применяется ко всем стратегиям. Чтобы сравнить "
-            "варианты, выполните расчёт отдельно для X и Y."
+            "Размеры X и Y относятся только к обрабатываемой части. Две "
+            "разворотные зоны добавляются снаружи вдоль направления проходов. "
+            "Чтобы сравнить направления, выполните расчёт отдельно для X и Y."
         )
         input_hint.setObjectName("mutedText")
         input_hint.setWordWrap(True)
@@ -1278,9 +1272,16 @@ class SingleTab(QWidget):
     def update_coordinate_limits(self) -> None:
         """Не позволять стартовым координатам выходить за границы поля."""
 
+        axis = str(self.axis.currentData())
+        total_x = self.field_x.value()
+        total_y = self.field_y.value()
+        if axis == "x":
+            total_x += 2.0 * self.turn_zone.value()
+        else:
+            total_y += 2.0 * self.turn_zone.value()
         for machine_index in (1, 2):
-            self.inputs[f"coord_x{machine_index}"].setMaximum(self.field_x.value())
-            self.inputs[f"coord_y{machine_index}"].setMaximum(self.field_y.value())
+            self.inputs[f"coord_x{machine_index}"].setMaximum(total_x)
+            self.inputs[f"coord_y{machine_index}"].setMaximum(total_y)
 
     def build_row(self) -> pd.Series:
         values: dict[str, object] = {

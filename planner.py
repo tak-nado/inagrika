@@ -55,7 +55,8 @@ class FieldGeometry:
     """Геометрия поля для выбранного направления рабочих проходов.
 
     ``axis='x'`` означает движение вдоль длины поля, ``axis='y'`` — вдоль
-    ширины. С обоих концов рабочего прохода исключаются разворотные зоны.
+    ширины. ``field_x`` и ``field_y`` задают только обрабатываемую часть поля;
+    разворотные зоны добавляются с обоих концов рабочего прохода.
     """
 
     axis: str
@@ -67,10 +68,9 @@ class FieldGeometry:
 
     @property
     def run_length(self) -> float:
-        """Вернуть полезную длину одного рабочего прохода без разворотных зон."""
+        """Вернуть длину одного рабочего прохода."""
 
-        full = self.field_x if self.axis == "x" else self.field_y
-        return full - 2.0 * self.turn_zone_width
+        return self.field_x if self.axis == "x" else self.field_y
 
     @property
     def sweep_width(self) -> float:
@@ -78,21 +78,53 @@ class FieldGeometry:
 
         return self.field_y if self.axis == "x" else self.field_x
 
+    @property
+    def total_x(self) -> float:
+        """Вернуть полный габарит маршрута по X с разворотными зонами."""
+
+        extra = 2.0 * self.turn_zone_width if self.axis == "x" else 0.0
+        return self.field_x + extra
+
+    @property
+    def total_y(self) -> float:
+        """Вернуть полный габарит маршрута по Y с разворотными зонами."""
+
+        extra = 2.0 * self.turn_zone_width if self.axis == "y" else 0.0
+        return self.field_y + extra
+
     def entry_point(self, lateral: float, far_end: bool) -> Point:
         """Получить точку входа в проход на ближнем или дальнем краю посева."""
 
         if self.axis == "x":
-            x = self.field_x - self.turn_zone_width if far_end else self.turn_zone_width
+            x = self.turn_zone_width + (self.field_x if far_end else 0.0)
             return (x, lateral)
-        y = self.field_y - self.turn_zone_width if far_end else self.turn_zone_width
+        y = self.turn_zone_width + (self.field_y if far_end else 0.0)
         return (lateral, y)
 
     def outer_point(self, lateral: float, far_end: bool) -> Point:
         """Получить точку на внешней границе соответствующей разворотной зоны."""
 
         if self.axis == "x":
-            return (self.field_x if far_end else 0.0, lateral)
-        return (lateral, self.field_y if far_end else 0.0)
+            return (self.total_x if far_end else 0.0, lateral)
+        return (lateral, self.total_y if far_end else 0.0)
+
+    def headland_point(self, lateral: float, far_end: bool, depth: float) -> Point:
+        """Получить точку внутри разворотной зоны на заданной глубине от посева."""
+
+        if not 0.0 <= depth <= self.turn_zone_width + EPS:
+            raise ValueError("точка остановки должна находиться в разворотной зоне")
+        safe_depth = min(depth, self.turn_zone_width)
+        if self.axis == "x":
+            work_edge = self.turn_zone_width + (self.field_x if far_end else 0.0)
+            return (work_edge + (safe_depth if far_end else -safe_depth), lateral)
+        work_edge = self.turn_zone_width + (self.field_y if far_end else 0.0)
+        return (lateral, work_edge + (safe_depth if far_end else -safe_depth))
+
+    def contains(self, point: Point) -> bool:
+        """Проверить принадлежность точки полной области вместе с разворотами."""
+
+        x, y = point
+        return -EPS <= x <= self.total_x + EPS and -EPS <= y <= self.total_y + EPS
 
 
 @dataclass(frozen=True)
@@ -389,24 +421,24 @@ def perimeter_path(start: Point, entry: Point, geometry: FieldGeometry,
         entry[1] if geometry.axis == "x" else entry[0], far_end
     )
     if geometry.axis == "x":
-        current_far = start[0] > geometry.field_x / 2.0
+        current_far = start[0] > geometry.total_x / 2.0
         if current_far == far_end:
             return [outer_entry, entry]
         edge = min(
-            (0.0, geometry.field_y),
+            (0.0, geometry.total_y),
             key=lambda y: abs(start[1] - y) + abs(entry[1] - y),
         )
-        opposite_x = geometry.field_x if far_end else 0.0
+        opposite_x = geometry.total_x if far_end else 0.0
         return [(start[0], edge), (opposite_x, edge), outer_entry, entry]
 
-    current_far = start[1] > geometry.field_y / 2.0
+    current_far = start[1] > geometry.total_y / 2.0
     if current_far == far_end:
         return [outer_entry, entry]
     edge = min(
-        (0.0, geometry.field_x),
+        (0.0, geometry.total_x),
         key=lambda x: abs(start[0] - x) + abs(entry[0] - x),
     )
-    opposite_y = geometry.field_y if far_end else 0.0
+    opposite_y = geometry.total_y if far_end else 0.0
     return [(edge, start[1]), (edge, opposite_y), outer_entry, entry]
 
 
@@ -416,9 +448,9 @@ def point_on_boundary(point: Point, geometry: FieldGeometry) -> bool:
     x, y = point
     return bool(
         abs(x) <= EPS
-        or abs(x - geometry.field_x) <= EPS
+        or abs(x - geometry.total_x) <= EPS
         or abs(y) <= EPS
-        or abs(y - geometry.field_y) <= EPS
+        or abs(y - geometry.total_y) <= EPS
     )
 
 
@@ -426,8 +458,8 @@ def boundary_coordinate(point: Point, geometry: FieldGeometry) -> float:
     """Получить координату точки на периметре по часовой стрелке."""
 
     x, y = point
-    width = geometry.field_x
-    height = geometry.field_y
+    width = geometry.total_x
+    height = geometry.total_y
     if abs(y) <= EPS:
         return min(width, max(0.0, x))
     if abs(x - width) <= EPS:
@@ -442,8 +474,8 @@ def boundary_coordinate(point: Point, geometry: FieldGeometry) -> float:
 def boundary_point(coordinate: float, geometry: FieldGeometry) -> Point:
     """Преобразовать координату периметра обратно в точку поля."""
 
-    width = geometry.field_x
-    height = geometry.field_y
+    width = geometry.total_x
+    height = geometry.total_y
     perimeter = 2.0 * (width + height)
     value = coordinate % perimeter
     if value <= width:
@@ -468,14 +500,14 @@ def perimeter_return_path(start: Point, finish: Point,
         raise ValueError("возврат к старту возможен только для точки на границе")
     start_value = boundary_coordinate(start, geometry)
     finish_value = boundary_coordinate(finish, geometry)
-    perimeter = 2.0 * (geometry.field_x + geometry.field_y)
+    perimeter = 2.0 * (geometry.total_x + geometry.total_y)
     clockwise_distance = (finish_value - start_value) % perimeter
     counter_distance = (start_value - finish_value) % perimeter
     corners = (
         0.0,
-        geometry.field_x,
-        geometry.field_x + geometry.field_y,
-        2.0 * geometry.field_x + geometry.field_y,
+        geometry.total_x,
+        geometry.total_x + geometry.total_y,
+        2.0 * geometry.total_x + geometry.total_y,
         perimeter,
     )
 
@@ -509,7 +541,8 @@ def build_route(machine: Machine, geometry: FieldGeometry, passes: list[float],
         start_at_far_end: начинать рабочее движение с дальнего края поля.
 
     Returns:
-        Готовый маршрут либо ``None``, если разворотная зона слишком узкая.
+        Готовый маршрут либо ``None``, если разворотная зона слишком узкая для
+        манёвра или безопасной остановки после последнего прохода.
     """
 
     if not passes:
@@ -536,15 +569,26 @@ def build_route(machine: Machine, geometry: FieldGeometry, passes: list[float],
         ):
             return None
 
-    # Освобождаем рабочую и разворотную зоны после последнего прохода.
-    final_parking = geometry.outer_point(ordered[-1], boundary)
-    builder.move_to(final_parking, machine.travel_speed, "deadhead")
     if geometry.return_to_start:
+        final_field_edge = geometry.outer_point(ordered[-1], boundary)
+        builder.move_to(final_field_edge, machine.travel_speed, "deadhead")
         try:
-            return_path = perimeter_return_path(final_parking, machine.start, geometry)
+            return_path = perimeter_return_path(
+                final_field_edge, machine.start, geometry
+            )
         except ValueError:
             return None
         builder.follow(return_path, machine.travel_speed, "deadhead")
+    else:
+        # Ближайшая безопасная остановка находится внутри разворотной зоны.
+        # Центр машины отводится от посева на половину её длины с запасом.
+        parking_depth = machine.length / 2.0 + SAFETY_MARGIN
+        if parking_depth > geometry.turn_zone_width + EPS:
+            return None
+        final_parking = geometry.headland_point(
+            ordered[-1], boundary, parking_depth
+        )
+        builder.move_to(final_parking, machine.travel_speed, "deadhead")
 
     return Route(
         segments=builder.segments,
